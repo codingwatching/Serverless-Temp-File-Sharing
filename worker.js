@@ -21,6 +21,10 @@ export default {
     },
 };
 
+// Access Token Cache (persists within the same Worker isolate across requests)
+let cachedToken = null;
+let tokenExpiry = 0;
+
 async function handleRequest(request, env) {
     const url = new URL(request.url);
     const host = request.headers.get("host");
@@ -33,21 +37,23 @@ async function handleRequest(request, env) {
         const fileId = url.searchParams.get("id");
         const fileName = url.searchParams.get("name");
 
-        // Check if the file exists in Google Drive
-        const fileExists = await checkFileExists(fileId, env);
-
-        if (fileExists) {
-            const encodedFileName = decodeURIComponent(fileName);
-            const fileLink = `https://${host}/download?id=${fileId}&name=${encodeURIComponent(encodedFileName)}`;
-            return new Response(downloadPage(fileLink, encodedFileName, env), {
-                headers: { 'content-type': 'text/html; charset=utf-8' },
-            });
-        } else {
+        // Validate required parameters
+        if (!fileId || !fileName) {
             return new Response(notFoundFile(env), {
                 status: 404,
                 headers: { 'content-type': 'text/html; charset=utf-8' },
             });
         }
+
+        // Skip file existence check — user was just redirected from a successful upload,
+        // so the file is guaranteed to exist. Checking here causes false "expired" results
+        // due to Google Drive propagation delay / OAuth token timing.
+        // The real existence check happens at /download time.
+        const encodedFileName = decodeURIComponent(fileName);
+        const fileLink = `https://${host}/download?id=${fileId}&name=${encodeURIComponent(encodedFileName)}`;
+        return new Response(downloadPage(fileLink, encodedFileName, env), {
+            headers: { 'content-type': 'text/html; charset=utf-8' },
+        });
     } else if (url.pathname === "/download") {
         const fileId = url.searchParams.get("id");
         const fileName = url.searchParams.get("name");
@@ -200,18 +206,33 @@ async function deleteFile(fileId, env) {
     return response.ok;
 }
 
-async function checkFileExists(fileId, env) {
-    const accessToken = await getAccessToken(env);
-    const response = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}`, {
-        headers: {
-            Authorization: `Bearer ${accessToken}`,
-        },
-    });
+async function checkFileExists(fileId, env, retries = 2) {
+    for (let attempt = 0; attempt <= retries; attempt++) {
+        const accessToken = await getAccessToken(env);
+        const response = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}`, {
+            headers: {
+                Authorization: `Bearer ${accessToken}`,
+            },
+        });
 
-    return response.ok;
+        if (response.ok) return true;
+
+        // If not the last attempt, wait briefly for Google Drive propagation
+        if (attempt < retries) {
+            await new Promise(resolve => setTimeout(resolve, 800));
+        }
+    }
+
+    return false;
 }
 
 async function getAccessToken(env) {
+    // Return cached token if still valid
+    const now = Date.now();
+    if (cachedToken && now < tokenExpiry) {
+        return cachedToken;
+    }
+
     const tokenResponse = await fetch("https://www.googleapis.com/oauth2/v4/token", {
         method: "POST",
         headers: {
@@ -226,7 +247,10 @@ async function getAccessToken(env) {
     });
 
     const tokenData = await tokenResponse.json();
-    return tokenData.access_token;
+    cachedToken = tokenData.access_token;
+    // Cache for 55 minutes (Google tokens expire after 60 min, 5 min safety margin)
+    tokenExpiry = now + (55 * 60 * 1000);
+    return cachedToken;
 }
 
 // ===========================
